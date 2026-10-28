@@ -22,3 +22,6 @@ htmlcov/
 
 # Generated outputs
 output/
+
+# Personal notes
+DECISIONS.md
