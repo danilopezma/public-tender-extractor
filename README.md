@@ -1,85 +1,48 @@
 # public-tender-extractor
 
-Extracts structured data from public tender documents (minutes, specifications, awards) from PDFs.
+Extracts the **concurrency** of a public tender from the meeting record PDF (acta de la mesa de contratación): who bid on each lot, what they offered, their scores and ranking.
 
-## Structure
-
-```
-tender_extractor/
-├── extraction/   # PDF reading and raw field extraction
-├── models/       # tender data models
-├── validation/   # validation and normalization
-└── export/       # result export (JSON, CSV)
-data/             # sample documents (not versioned)
-tests/
-```
-
-Pipeline: `extraction → models → validation → export`. Each step depends only on the previous one.
-
-| Folder | Responsibility |
-| --- | --- |
-| `extraction/` | Reads PDFs with `pdfplumber` and pulls out raw text, tables and candidate fields (contracting authority, amounts, dates, bidders). Output has no quality guarantees. |
-| `models/` | Defines the data shape with `pydantic` (e.g. `Tender`, `Bidder`, `Award`): fields, types and required values. Shared by all other folders. |
-| `validation/` | Cleans and checks extracted data: parses amounts and dates, cross-checks consistency (e.g. the awardee is among the bidders) and flags missing or doubtful fields. |
-| `export/` | Writes validated models to JSON, CSV or other formats. |
-
-## Setup
-
-This is a regular Python project, not an installable library.
+## Run
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-## Tests
-
-```bash
+ollama pull hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M   # local LLM, Ollama must be running
+python main.py [path/to/meeting_record.pdf] [--output-dir output]
 pytest
 ```
 
-## Usage
+Writes to `output/`:
 
-```bash
-python -m tender_extractor.extraction path/to/tender.pdf [--output-dir output]
+- `concurrencia.json` and `concurrencia.xlsx`: the expediente and one row per lot, order and bidder.
+- `incidencias.json`: what could not be read or does not match. Nothing is corrected silently.
+
+## How it works
+
+```
+main.py
+tender_extractor/
+├── extraction/
+│   ├── pdf.py        # upright pages, annexes, cell OCR
+│   ├── tables.py     # offers table (Annex 1) and order of prelation (Annex 2)
+│   ├── narrative.py  # prose: expediente, meeting date, abnormally low offers (LLM)
+│   └── extractor.py  # puts it together
+├── models/schema.py  # Tender, Bidder, Offer, Issue
+└── export/writers.py # json and xlsx
 ```
 
-Writes to `output/<pdf name>/`:
+- **Tables are deterministic.** Columns, rows and bidder blocks come from the drawn lines and word positions, not from a model. The offers annex is a rotated landscape table with a damaged text layer, so pages are turned upright first, the euro columns are read by OCR cell by cell (RapidOCR, any platform) and the rest from the text layer.
+- **The LLM only reads prose** (expediente fields, who is flagged as abnormally low and where). Whatever it returns must appear verbatim in the PDF text or it is dropped. If Ollama is down the run still ends, with an `LLM_UNAVAILABLE` issue.
+- **Figures are exact.** Amounts are `Decimal`, floats are rejected, money needs exactly two decimals, and a partly read cell becomes an issue instead of a number.
+- **Lot and order are strings** kept as written (`"1.10"` is not `"1.1"`).
 
-- `native_pXX-pYY.json` / `.md`: Docling document (intermediate representation) and Markdown for each run of pages with a text layer.
-- `scanned_pXX-pYY.json` / `.md`: the same for scanned pages, converted with forced full-page OCR.
-- `report.json`: status, conversion errors (also logged), per-page text counts, tables and multipage table candidates.
+## Why `pdfplumber` and not Docling
 
-Conversion errors never abort the run; they are logged and stored in the report.
+I started with Docling because I knew it. On the real file it shifted the cells of the rotated annex, its OCR returned wrong digits under a margin stamp, and it took about 2 of the 4-5 minutes of a run for output the table parsers did not use. `pdfplumber` gives word boxes and the drawn lines with coordinates, which is what a deterministic parser needs.
 
-`pytest.ini` adds the project root to the import path, so no installation is needed.
+## Limits
 
-## Roadmap
-
-### Phase 1 — Initialization (done)
-
-- Repository and Python environment (`.venv`)
-- `.gitignore`, `requirements.txt` and an initial README
-- Basic package layout separating extraction, models, validation and export
-- Smoke test to confirm the package imports
-
-### Phase 2 — Document extraction (done)
-
-End-to-end PDF reading with Docling, saving the intermediate representation and a conversion report. Concurrency/lot interpretation is not done yet.
-
-Findings on the sample minutes (50 pages: 12 native, 38 scanned annex):
-
-- **Scanned annex:** the scanned pages carry a 22-character watermark text layer, so Docling's default OCR skips them and returns almost nothing (empty tables). Pages are now classified with `pdfplumber` and scanned runs are converted with `force_full_page_ocr`. This recovers the text and tables (about 1.6 s/page on Apple GPU). OCR is imperfect (e.g. "ESFIBRILADOR"), and a few pages (21, 28, 42) still come out nearly empty.
-- **Multipage tables:** Docling does not merge tables across pages; each page fragment is a separate table. The report lists consecutive-page tables with the same column count as merge candidates (8 in the sample). A repeated header row is only a weak signal, so merging is left for a later phase.
-- **Segments:** each segment is saved as its own document because `DoclingDocument.concatenate` renumbers pages.
-
-### Phase 3 — Data model (done)
-
-Pydantic models in `tender_extractor/models/`, independent of the PDF format:
-
-- `Tender` (expediente), `Bidder`, `Offer` and `Issue`.
-- Amounts and scores are `Decimal`. Floats are rejected, so a figure cannot pick up binary rounding error, and JSON output writes them as strings (`"12789.50"`).
-- `lot` and `order` are strings kept as written (`"1.10"` is not `"1.1"`); numbers are rejected.
-- Every figure on an `Offer` is optional: a missing or unreadable value stays `None` and becomes an `Issue`, never a guess.
-- Unknown fields are errors (`extra="forbid"`).
+- Tested on one meeting record file. The offers parser expects 11 columns in a fixed order.
+- Scanned pages (here the technical report, Annex 3) are not read; they are reported as an issue. That report holds the quantity per order and the breakdown of the qualitative points, which a validation step would need.
+- Not implemented: validation (scores add up, ranking matches scores, offer not above tender price), page of origin per figure, other organisms (160 meeting records).
+- Assumptions: `proposed_awardee` is `ranking == 1`; `abnormally_low` is true only for the offers the text names.

@@ -1,1 +1,1 @@
-"""Document (PDF) reading and raw field extraction."""
+"""Concurrency extraction: who bid on each lot, what they offered and how they ranked."""

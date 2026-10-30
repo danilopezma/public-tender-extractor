@@ -1,119 +1,193 @@
-"""PDF to Docling conversion, with the intermediate representation saved to disk.
+"""Concurrency extraction: reads the meeting record and builds the offers and the issues."""
 
-The PDF is split into contiguous segments: pages with a native text layer and
-scanned pages. Docling skips OCR on pages that carry any text layer, even a
-tiny watermark, so scanned segments are converted with full-page OCR forced.
-Each segment is saved as its own Docling document, keeping the original page
-numbers (DoclingDocument.concatenate would renumber them).
-"""
-
-import logging
-import time
+import re
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional
 
 import pdfplumber
-from docling.datamodel.base_models import ConversionStatus, InputFormat
-from docling.datamodel.pipeline_options import OcrAutoOptions, PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
 
-from tender_extractor.extraction.report import build_segment_report, generate_report
+from tender_extractor.extraction import narrative
+from tender_extractor.extraction.narrative import LLMError
+from tender_extractor.extraction.pdf import (
+    cell_reader, derotate, find_annexes, native_pages, upright_words,
+)
+from tender_extractor.extraction.tables import (
+    MONEY_FIELDS, OfferRow, RankingRow, parse_amount, parse_offers_page, parse_ranking,
+)
+from tender_extractor.models import Bidder, Issue, Offer, Tender
 
-logger = logging.getLogger(__name__)
-
-# Pages with fewer native text characters than this are treated as scanned.
-SCANNED_TEXT_THRESHOLD = 100
-
-Segment = Tuple[int, int, str]  # (first_page, last_page, "native" | "scanned")
+POINT_FIELDS = ("price_points", "quality_points", "total_points")
 
 
-def extract_document(pdf_path: Path, output_dir: Path) -> dict:
-    """Convert a PDF and write one document/markdown pair per segment plus report.json.
+@dataclass
+class Extraction:
+    """Result of the extraction: the tender, one offer per lot/order/bidder and the issues."""
 
-    Conversion errors are logged and stored in the report instead of being raised,
-    so partial results stay inspectable. Returns the report.
+    tender: Optional[Tender]
+    offers: List[Offer] = field(default_factory=list)
+    issues: List[Issue] = field(default_factory=list)
+
+
+def extract_concurrency(pdf_path: Path) -> Extraction:
+    """Extract the concurrency from a tender meeting record PDF.
+
+    Problems never stop the run: they become issues and the value stays None. The expediente
+    and the abnormally-low flags need the LLM; if it is down the run still ends, with one
+    LLM_UNAVAILABLE issue.
+
+    Args:
+        pdf_path: Meeting record PDF.
+
+    Returns:
+        The tender (None if its number could not be read), the offers and the issues.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    issues: List[Issue] = []
 
-    # 1. Get page segments by kind (native or scanned) -----------------------------------
-    started = time.time()
-    try:
-        segments = detect_segments(pdf_path)
-    except Exception as exc:
-        logger.exception("Cannot read %s", pdf_path)
-        error = {"component": "pdf-reader", "message": repr(exc)}
-        # Generate failure report
-        return generate_report(output_dir, pdf_path, [], time.time() - started, errors=[error])
+    with tempfile.TemporaryDirectory() as tmp:
+        # 1. Read the PDF: upright copy, annexes and narrative text -----------
+        upright = Path(tmp) / "upright.pdf"
+        derotate(pdf_path, upright)
+        pages = native_pages(upright)
+        with pdfplumber.open(upright) as pdf:
+            # Find the anexes: Annex 1 (offers) and Annex 2 (order of prelation)
+            annexes = find_annexes(pdf, pages)
+            # Get the narrative text: all pages before any annex, skipping scanned pages
+            text = "\n".join(pdf.pages[n - 1].extract_text() or "" for n in pages
+                             if all(n < annex.start for annex in annexes.values()))
+            # Report the scanned pages that have no text layer
+            scanned = [n for n in range(1, len(pdf.pages) + 1) if n not in pages]
+            if scanned:
+                issues.append(Issue(code="PAGES_NOT_READ", field="pages", message=(
+                    f"Pages {scanned[0]}-{scanned[-1]} have no text layer (scanned): not read")))
 
-    # 2. Convert each segment and save as JSON/Markdown -----------------------------------
-    native_converter = _build_converter(force_ocr=False)
-    scanned_converter = _build_converter(force_ocr=True)
-    segment_reports = []
-    for first, last, kind in segments:
-        name = f"{kind}_p{first}-p{last}"
-        logger.info(f"Converting {name} (pages {first}-{last})")
-        converter = native_converter if kind == "native" else scanned_converter
-        seg_started = time.time()
-        try:
-            result = converter.convert(pdf_path, page_range=(first, last), raises_on_error=False)
-        except Exception as exc:
-            logger.exception("Segment %s failed", name)
-            segment_reports.append(
-                {
-                    "name": name, "kind": kind, "first_page": first, "last_page": last,
-                    "status": "failure",
-                    "errors": [{"component": "converter", "message": repr(exc)}],
-                }
-            )
+            # 2. Read the tables: offers (Annex 1) and ranking (Annex 2)
+            rows: List[OfferRow] = []
+            for number in annexes.get(1, []):
+                page = pdf.pages[number - 1]
+                stamp = [c for c in page.chars if not c["upright"]]
+                try:
+                    rows += parse_offers_page(upright_words(page), page.vertical_edges,
+                                              page.horizontal_edges, number,
+                                              cell_reader(upright, number), stamp)
+                except ValueError as exc:
+                    issues.append(Issue(code="PAGE_UNREADABLE", field="page",
+                                        message=f"Annex 1 page {number}: {exc}"))
+            ranking: List[RankingRow] = parse_ranking([(n, upright_words(pdf.pages[n - 1])) for n in annexes.get(2, [])])
+    if not rows:
+        issues.append(Issue(code="NO_OFFERS", message="No offers table (Annex 1) could be read"))
+
+    # 3. Build the offers -----------------------------------------------------
+    offers = _build_offers(rows, ranking, issues)
+
+    # 4. Read the prose with the LLM: expediente and abnormally low offers ----
+    tender, llm_reachable = _read_tender(text, issues)
+    if llm_reachable:
+        _flag_abnormally_low(text, offers, issues)
+    return Extraction(tender, offers, issues)
+
+
+def _build_offers(rows: List[OfferRow], ranking: List[RankingRow], issues: List[Issue]) -> List[Offer]:
+    """Turn the raw table rows into offers, reporting what cannot be turned.
+
+    Args:
+        rows: Raw rows of the offers table.
+        ranking: Rows of the order of prelation, with their lot.
+        issues: List where problems are appended.
+
+    Returns:
+        One Offer per row that has a bidder. A missing or partly read figure stays None.
+    """
+    by_bidder = {(r.lot, r.tax_id): r for r in ranking}
+    offers, previous = [], None
+    for row in rows:
+        # 1. A bidder cell split by a page break is taken from the previous row ----------------
+        if row.tax_id is None and previous and previous.lot == row.lot:
+            for name in ("tax_id", "bidder") + POINT_FIELDS:
+                setattr(row, name, getattr(previous, name))
+            issues.append(Issue(code="BIDDER_INHERITED", lot=row.lot, order=row.order,
+                                bidder=row.tax_id, message=f"Page {row.page}: bidder and points "
+                                "taken from the previous row (table split by a page break)"))
+        previous = row
+        if row.bidder is None:
+            issues.append(Issue(code="BIDDER_MISSING", lot=row.lot, order=row.order,
+                                message=f"Page {row.page}: no bidder for this row"))
             continue
 
-        for error in result.errors:
-            logger.error(
-                f"Conversion error in {name} [{error.component_type.value}]: {error.error_message}",
-            )
-        if result.status != ConversionStatus.SUCCESS:
-            logger.warning(f"Segment {name} finished with status {result.status.value}")
+        # 2. Parse the figures, strictly --------------------------------------
+        values = {}
+        for name in MONEY_FIELDS + POINT_FIELDS:
+            raw = getattr(row, name)
+            try:
+                values[name] = parse_amount(raw or "", decimals=2 if name in MONEY_FIELDS else None)
+            except ValueError:
+                issues.append(Issue(code="FIGURE_UNREADABLE", lot=row.lot, order=row.order,
+                                    bidder=row.tax_id, field=name,
+                                    message=f"Page {row.page}: {name} is {raw!r}"))
 
-        result.document.save_as_json(output_dir / f"{name}.json")
-        result.document.save_as_markdown(output_dir / f"{name}.md")
-        segment_reports.append(
-            build_segment_report(result, name, kind, first, last, time.time() - seg_started)
-        )
+        # 3. Match the order of prelation and build the offer -----------------
+        rank = by_bidder.get((row.lot, row.tax_id))
+        if rank is None:
+            issues.append(Issue(code="RANKING_NOT_FOUND", lot=row.lot, order=row.order,
+                                bidder=row.tax_id, message="Bidder not in the order of prelation"))
+        offers.append(Offer(
+            lot=row.lot, order=row.order, bidder=Bidder(name=row.bidder, tax_id=row.tax_id),
+            ranking=rank.ranking if rank else None,
+            proposed_awardee=(rank.ranking == 1) if rank else None, **values,
+        ))
+    return offers
 
-    # 3. Generate final report  --------------------------------------------------
-    report = generate_report(output_dir, pdf_path, segment_reports, time.time() - started)
-    
-    logger.info(f"Generated report for {pdf_path} in {output_dir}")
-    return report
 
+def _read_tender(text: str, issues: List[Issue]):
+    """Read the expediente: fields by LLM, meeting date by pattern.
 
-def detect_segments(pdf_path: Path) -> List[Segment]:
-    """
-    Group consecutive pages by whether they are native or scanned.
+    Args:
+        text: Narrative text of the meeting record.
+        issues: List where problems are appended.
 
-    Args:  
-        pdf_path: Path to the PDF file.
     Returns:
-        A list of segments, each represented as a tuple (first_page, last_page, kind),
-        where kind is either "native" or "scanned".
+        (tender, reachable): the Tender (None without a file number) and whether the LLM answered.
     """
-    segments: List[Segment] = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for number, page in enumerate(pdf.pages, start=1):
-            kind = "native" if len(page.extract_text() or "") >= SCANNED_TEXT_THRESHOLD else "scanned"
-            if segments and segments[-1][2] == kind:
-                segments[-1] = (segments[-1][0], number, kind)
-            else:
-                segments.append((number, number, kind))
-    return segments
+    fields, reachable = {"file_number": None, "subject": None, "contracting_authority": None}, True
+    try:
+        fields = narrative.tender_fields(text[:3000])
+    except LLMError as exc:
+        reachable = False
+        issues.append(Issue(code="LLM_UNAVAILABLE", field="llm", message=(
+            f"{exc}. Expediente and abnormally-low flags not extracted; start Ollama and run again")))
+    date = narrative.meeting_date(text)
+    for name, value in list(fields.items()) + [("meeting_date", date)]:
+        if value is None:
+            issues.append(Issue(code="TENDER_FIELD_MISSING", field=name,
+                                message=f"{name} not found in the meeting record's text"))
+    tender = Tender(meeting_date=date, **fields) if fields["file_number"] else None
+    return tender, reachable
 
 
-def _build_converter(force_ocr: bool = False) -> DocumentConverter:
-    options = PdfPipelineOptions()
-    options.do_ocr = True
-    options.do_table_structure = True
-    if force_ocr:
-        options.ocr_options = OcrAutoOptions(force_full_page_ocr=True, lang=["es-ES"])
-    return DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
-    )
+def _flag_abnormally_low(text: str, offers: List[Offer], issues: List[Issue]) -> None:
+    """Mark the offers that the meeting record says are presumed abnormally low (changed in place).
+
+    Only the offers of the named bidder whose order is among the named positions are marked;
+    the others stay None, because not being mentioned is not a statement.
+
+    Args:
+        text: Narrative text of the meeting record.
+        offers: Offers to mark.
+        issues: List where problems are appended.
+    """
+    def _key(name):
+        return re.sub(r"[^a-z0-9]+", " ", name.casefold()).strip()
+
+    for paragraph in narrative.abnormal_paragraphs(text):
+        try:
+            findings = narrative.abnormal_findings(paragraph)
+        except LLMError as exc:
+            issues.append(Issue(code="LLM_UNAVAILABLE", field="abnormally_low", message=str(exc)))
+            return
+        for finding in findings:
+            for offer in offers:
+                if _key(offer.bidder.name) == _key(finding["bidder_name"]) and (
+                        not finding["positions"] or offer.order in finding["positions"]):
+                    offer.abnormally_low = True
+                    offer.abnormally_low_positions = finding["positions"]
