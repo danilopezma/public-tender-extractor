@@ -17,6 +17,7 @@ from tender_extractor.extraction.tables import (
     MONEY_FIELDS, OfferRow, RankingRow, parse_amount, parse_offers_page, parse_ranking,
 )
 from tender_extractor.models import Bidder, Issue, Offer, Tender
+from tender_extractor.validation import validate
 
 POINT_FIELDS = ("price_points", "quality_points", "total_points")
 
@@ -33,7 +34,8 @@ class Extraction:
 def extract_concurrency(pdf_path: Path) -> Extraction:
     """Extract the concurrency from a tender meeting record PDF.
 
-    Problems never stop the run: they become issues and the value stays None. The expediente
+    Problems never stop the run: they become issues and the value stays None. The extracted
+    data is then validated (coherence checks, reported and never corrected). The expediente
     and the abnormally-low flags need the LLM; if it is down the run still ends, with one
     LLM_UNAVAILABLE issue.
 
@@ -41,7 +43,8 @@ def extract_concurrency(pdf_path: Path) -> Extraction:
         pdf_path: Meeting record PDF.
 
     Returns:
-        The tender (None if its number could not be read), the offers and the issues.
+        The tender (None if its number could not be read), the offers and the issues, both
+        from the extraction and from the validation.
     """
     issues: List[Issue] = []
 
@@ -81,7 +84,10 @@ def extract_concurrency(pdf_path: Path) -> Extraction:
     # 3. Build the offers -----------------------------------------------------
     offers = _build_offers(rows, ranking, issues)
 
-    # 4. Read the prose with the LLM: expediente and abnormally low offers ----
+    # 4. Validate: coherence checks, reported and never corrected -------------
+    issues += validate(offers, ranking)
+
+    # 5. Read the prose with the LLM: expediente and abnormally low offers ----
     tender, llm_reachable = _read_tender(text, issues)
     if llm_reachable:
         _flag_abnormally_low(text, offers, issues)

@@ -99,7 +99,7 @@ def offer_row(order, **kwargs):
 
 def test_offer_gets_exact_decimals_and_its_ranking():
     issues = []
-    [offer] = extractor._build_offers([offer_row("1.1")], [RankingRow(10, 1, "A1", "ALFA", "1")], issues)
+    [offer] = extractor._build_offers([offer_row("1.1")], [RankingRow(10, 1, "A1", "ALFA", lot="1")], issues)
     offer_ok = (offer.offered_unit_price, offer.ranking, offer.proposed_awardee) == (Decimal("9.50"), 1, True)
     assert offer_ok and not issues
 

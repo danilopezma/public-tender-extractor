@@ -48,6 +48,7 @@ class RankingRow:
     ranking: int
     tax_id: str
     name: str
+    total_points: Optional[str] = None
     lot: Optional[str] = None
 
 
@@ -207,7 +208,8 @@ def parse_ranking(pages: List[Tuple[int, List[dict]]]) -> List[RankingRow]:
                            and (score is None or w["x1"] <= score["x0"] + 0.5)
                            and low <= _center(w) <= high), key=lambda w: (round(w["top"]), w["x0"]))
             rows.append(RankingRow(number, int(ints[-1]["text"]), anchor["text"],
-                                   " ".join(w["text"] for w in name)))
+                                   " ".join(w["text"] for w in name),
+                                   total_points=score["text"] if score else None))
             positions.append((number, y))
 
         # Lot labels that sit alone in the lot column, left of the ranking column.
